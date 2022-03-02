@@ -1,0 +1,319 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+[//]: # (Startup and loading libraries)
+```{r message = FALSE, warning = FALSE}
+rm(list = ls())
+#setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+#knitr::opts_knit$set(root.dir = dirname(rstudioapi::getActiveDocumentContext()$path))
+
+list_of_packages <- c("cluster", "data.table", "fpc", "skimr", "stats", "tidyselect", "tidyr", "zoo")
+new_packages <- list_of_packages[!(list_of_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+invisible(lapply(list_of_packages, require, character.only = TRUE))
+
+rm(list_of_packages, new_packages)
+cat("Startup and loading libraries successful.")
+```
+
+
+[//]: # (Loading data)
+```{r message = FALSE, warning = FALSE}
+data_set <- data.table::fread("http://archive.ics.uci.edu/ml/machine-learning-databases/wine/wine.data")
+# data_set <- data.table::fread("http://archive.ics.uci.edu/ml/machine-learning-databases/00292/Wholesale%20customers%20data.csv", header = TRUE)
+rename = TRUE
+if (rename == TRUE) {
+colnames(data_set) <- (c(
+  "class",
+  "Alcohol",
+  "Malic acid",
+  "Ash",
+  "Alcalinity of ash  ",
+  "Magnesium",
+  "Total phenols",
+  "Flavanoids",
+  "Nonflavanoid phenols",
+  "Proanthocyanins",
+  "Color intensity",
+  "Hue",
+  "OD280/OD315 of diluted wines",
+  "Proline"
+))}
+rm(rename)
+cat("Loading Data successful.")
+```
+
+
+[//]: # (Summary)
+```{r message = FALSE, warning = FALSE}
+skimr::skim(data_set)
+tibble::as_tibble(head(data_set))
+```
+
+
+[//]: # (Data preparation)
+```{r message = FALSE, warning = FALSE}
+## Subsetting
+data_set_subset <- data_set[,-1]
+## Placing NAs
+data_set_subset[data_set_subset == "?"] <- NA
+## Handling NAs
+data_set_subset <- zoo::na.aggregate(data_set_subset)
+##Transforming (i.e. log-transformation)
+
+##Handling Outlier (i.e. winsorization)
+
+## standartisation / normalisation
+#data_set_subset <- scale(data_set_subset)
+```
+
+
+[//]: # (hier. clustering)
+```{r message = FALSE, warning = FALSE}
+## distances that will be used
+distances_methods <- c(
+  1,  #"manhattan"
+  2,  #"euclidean"
+  ncol(data_set_subset) #"minkowski"
+)
+
+## + Mahalanobis (Cholesky decomposition speeds up the process)
+cholMaha <- function(X) {
+ dec <- chol(stats::cov(X))
+ tmp <- forwardsolve(t(dec), t(X))
+ dist(t(tmp))
+}
+
+
+## methods that will be used
+h_cluster_methods <- c(
+  "single",
+  "average",
+  "complete",
+  "ward"
+)
+
+## Either use 'for' to iterate over all distances and create the distance matrices...
+# for (i in 1:length(distances_methods)) {
+# distances[[i]] <- stats::dist(data_set_subset,
+#                               method	= "minkowski",
+#                               diag = TRUE,
+#                               upper = FALSE,
+#                               p = distances_methods[i])
+# }
+
+## ...or use 'lapply'...
+# distances1 <- lapply(distances_methods,
+#                     stats::dist,
+#                     x = data_set_subset,
+#                     method	= "minkowski",
+#                     diag = TRUE,
+#                     upper = FALSE
+#                     )
+
+## ...or use 'map' instead.
+distances <-  purrr::map(distances_methods,
+                         stats::dist,
+                         x = data_set_subset,
+                         method	= "minkowski",
+                         diag = TRUE,
+                         upper = FALSE
+                         )
+
+## + Mahalanobis
+distances[[length(distances) + 1]] <- cholMaha(data_set_subset)
+rm(cholMaha)
+
+
+## nested iteration over clustering methods (outer iteration)
+## and distance matrices (inner iteration)
+## with naming
+## to create a list of clusters for each combination
+h_cluster <- h_cluster_methods %>%
+  purrr::map( ~ (purrr::map(distances,
+                            hclust,
+                            method	= .x)) %>%
+                setNames(c(distances_methods,
+                           "Mahalanobis"))) %>%
+  setNames(h_cluster_methods)
+#fist layer: methods
+#second layer: distances
+```
+
+
+[//]: # (hier. evaluating)
+```{r message = FALSE, warning = FALSE}
+## functions to calculate gamma, alpha and stand. alpha
+## and the actual calculations,
+## functions to calculate ideal number of clusters
+## according to Mojenas and Milligan & Cooper
+## and - again - the actual calculations
+##
+## The calculations are done with nested 'map's as seen before.
+
+
+## Bacher:
+## 0.9 ≤ ɣ ≤ 1.0 sehr gut
+## 0.8 ≤ ɣ < 0.9 gut
+## 0.7 ≤ ɣ < 0.8 befriedigend
+## 0.6 ≤ ɣ < 0.7 noch ausreichend
+## 0   ≤ ɣ < 0.6 nicht ausreichend
+gamma_calc <- function(x, y) {
+  stats::cor((y), stats::cophenetic(x))
+}
+
+gamma_values <- h_cluster %>%
+  purrr::map(~ purrr::map2(.x, distances, gamma_calc))
+
+cat(unlist(gamma_values))
+
+## Jobson:
+## alpha_calc <- function(x) diff(c(0, x$height))
+## 
+## alpha_values <- h_cluster %>%
+##   purrr::map(~ purrr::map(.x, alpha_calc))
+
+
+##Mojenas and Milligan & Cooper:
+salpha_calc <- function(x) (x$height - mean(x$height)) / stats::sd(x$height)
+
+salpha_values <- h_cluster %>%
+  purrr::map(~ purrr::map(.x, salpha_calc))
+
+mojenas_h_cluster_calc <- function (x) {
+   (length(x) + 1 -
+      Position(function(y) y > 2.75, x))
+}
+
+milligan_cooper_h_cluster_calc <- function (x) {
+   (length(x) + 1 -
+      Position(function(y) y > 1.25, x))
+}
+
+mojenas_h_cluster_values <- salpha_values %>%
+  purrr::map(~ purrr::map(.x, mojenas_h_cluster_calc))
+
+milligan_cooper_h_cluster_values <- salpha_values %>%
+  purrr::map(~ purrr::map(.x, milligan_cooper_h_cluster_calc))
+
+cat(unlist(mojenas_h_cluster_values),"\n")
+cat(unlist(milligan_cooper_h_cluster_values),"\n")
+
+
+## exemplary plot
+h_cluster[[1]][[1]] %T>%
+plot(xlab = "Wine No.",
+     hang = -1,
+      cex = 0.3) %>%
+rect.hclust(k = milligan_cooper_h_cluster_values[[1]][[1]], border = "red")
+
+
+## Further evaluation:
+## checking for correlation between cluster and class
+h_cluster_cutree <- purrr::map2(h_cluster,
+                                mojenas_h_cluster_values,
+                                ~ purrr::map2(.x,
+                                              .y,
+                                              cutree))
+assocs_mojenas_aux2 <- h_cluster_cutree %>%
+  purrr::map(~ purrr::map(.x,
+                          cbind,
+                          data_set$class))
+
+assocs_mojenas <- assocs_mojenas_aux2 %>%
+  purrr::map(~ purrr::map(.x,
+                          DescTools::Assocs,
+                          1))
+
+rm(assocs_mojenas_aux2)
+
+max_cramersV_mojenas <- c(
+  unlist(assocs_mojenas, recursive = FALSE) %>%
+  purrr::map(3) %>%
+  unlist() %>%
+  which.max() %>%
+  names(),
+  unlist(assocs_mojenas, recursive = FALSE) %>%
+  purrr::map(3) %>%
+  unlist() %>%
+  max()
+)
+
+cat(max_cramersV_mojenas)
+```
+
+
+[//]: # (part. clustering and evaluation)
+```{r message = FALSE, warning = FALSE}
+set.seed(1337)
+
+## taking the highest number of suggested clusters from above as an estimation for max. K
+k_est <- max(unlist(mojenas_h_cluster_values),
+          unlist(milligan_cooper_h_cluster_values)
+         )
+
+
+## kmeans
+p_cluster <- purrr::map(c(2:k_est),
+                        stats::kmeans,
+                        x = data_set_subset,
+                        iter.max = 50
+                        # nstart = 25
+                        ) %>%
+  setNames(2:k_est)
+
+
+## calculation of the ideal number of clusters
+## according to Calinnski & Harabasz
+calinnski_harabasz_p_cluster_values <- p_cluster %>%
+  purrr::map("cluster") %>%
+  purrr::map(fpc::calinhara,
+             x = data_set_subset) %>%
+  unlist()
+
+calinnski_harabasz_p_cluster_ideal_k <- 
+  calinnski_harabasz_p_cluster_values %>%
+  which.min() %>%
+  names() %>%
+  as.numeric()
+
+cat(calinnski_harabasz_p_cluster_ideal_k,"\n")
+
+## calculation of the ideal number of clusters
+## according to Kaufman & Rousseeuw
+## 0.71 ≤ SC ≤ 1.00 starke Struktur
+## 0.51 ≤ SC ≤ 0.70 vernünftige Struktur 
+## 0.26 ≤ SC ≤ 0.50 schwache Struktur 
+## 0.00 ≤ SC ≤ 0.25 keine Struktur 
+kaufman_rousseeuw_p_cluster_values <- p_cluster %>%
+  purrr::map("cluster") %>%
+  purrr::map(cluster::silhouette,
+             distances[[2]]) %>%
+  purrr::map(colMeans) %>%
+  purrr::map("sil_width")
+
+cat(unlist(kaufman_rousseeuw_p_cluster_values),"\n")
+
+kaufman_rousseeuw_p_cluster_ideal_k <- 
+  kaufman_rousseeuw_p_cluster_values %>%
+  which.max() %>%
+  names() %>%
+  as.numeric()
+
+cat(kaufman_rousseeuw_p_cluster_ideal_k,"\n")
+
+
+## elbowplot
+withinss_sum <- p_cluster %>%
+  purrr::map("withinss") %>%
+  purrr::map(sum)
+
+plot(2:k_est,
+     withinss_sum,
+     type = "b",
+     xlab = "Cluster",
+     ylab = "Withiness",
+     lwd = 2)
+```
